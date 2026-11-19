@@ -1,5 +1,7 @@
 package com.saferoute.ai.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
+
 import jakarta.persistence.*;
 import java.time.LocalDateTime;
 
@@ -20,6 +22,7 @@ public class User {
     @Column(nullable = false)
     private String phone;
 
+    @JsonIgnore
     @Column(name = "password_hash", nullable = false)
     private String passwordHash;
 

@@ -1,13 +1,13 @@
 package com.saferoute.ai.controller;
 
-import com.saferoute.ai.model.SafetyZone;
-import com.saferoute.ai.service.SafetyZoneService;
-import org.springframework.http.ResponseEntity;
+import java.util.List;
+
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
-import java.util.List;
+import com.saferoute.ai.model.SafetyZone;
+import com.saferoute.ai.service.SafetyZoneService;
 
 @RestController
 @RequestMapping("/api")
@@ -20,7 +20,7 @@ public class SafetyZoneController {
     }
 
     @GetMapping("/safety-zones")
-    public ResponseEntity<List<SafetyZone>> getSafetyZones() {
-        return ResponseEntity.ok(safetyZoneService.getActiveZones());
+    public List<SafetyZone> zones() {
+        return safetyZoneService.getActiveZones();
     }
 }

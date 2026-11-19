@@ -1,8 +1,20 @@
 package com.saferoute.ai.model;
 
-import jakarta.persistence.*;
 import java.time.LocalDateTime;
 
+import com.saferoute.ai.geo.GeoPoint;
+
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.PrePersist;
+import jakarta.persistence.Table;
+
+/** A circular area flagged as risky (seeded demo data for now; community reports come later). */
 @Entity
 @Table(name = "safety_zones")
 public class SafetyZone {
@@ -14,7 +26,7 @@ public class SafetyZone {
     @Column(nullable = false)
     private String name;
 
-    @Column(nullable = false)
+    @Column(nullable = false, length = 500)
     private String description;
 
     @Column(nullable = false)
@@ -26,8 +38,9 @@ public class SafetyZone {
     @Column(name = "radius_km", nullable = false)
     private Double radiusKm;
 
-    @Column(name = "risk_level", nullable = false)
-    private String riskLevel;
+    @Enumerated(EnumType.STRING)
+    @Column(name = "risk_level", nullable = false, length = 20)
+    private RiskLevel riskLevel;
 
     @Column(nullable = false)
     private Boolean active = true;
@@ -38,6 +51,14 @@ public class SafetyZone {
     @PrePersist
     protected void onCreate() {
         createdAt = LocalDateTime.now();
+    }
+
+    public GeoPoint centre() {
+        return new GeoPoint(latitude, longitude);
+    }
+
+    public double radiusMeters() {
+        return radiusKm * 1000.0;
     }
 
     public Long getId() {
@@ -88,11 +109,11 @@ public class SafetyZone {
         this.radiusKm = radiusKm;
     }
 
-    public String getRiskLevel() {
+    public RiskLevel getRiskLevel() {
         return riskLevel;
     }
 
-    public void setRiskLevel(String riskLevel) {
+    public void setRiskLevel(RiskLevel riskLevel) {
         this.riskLevel = riskLevel;
     }
 
@@ -106,9 +127,5 @@ public class SafetyZone {
 
     public LocalDateTime getCreatedAt() {
         return createdAt;
-    }
-
-    public void setCreatedAt(LocalDateTime createdAt) {
-        this.createdAt = createdAt;
     }
 }

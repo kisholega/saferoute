@@ -1,90 +1,125 @@
 package com.saferoute.ai.service;
 
-import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
+import com.saferoute.ai.config.SafeRouteProperties;
 import com.saferoute.ai.dto.EmergencyContactRequest;
+import com.saferoute.ai.exception.FieldValidationException;
+import com.saferoute.ai.exception.NotFoundException;
 import com.saferoute.ai.model.EmergencyContact;
 import com.saferoute.ai.repository.EmergencyContactRepository;
 
+/**
+ * Emergency contacts of the signed-in user.
+ * <p>
+ * Rules: phone numbers are stored in E.164 format, a number can only be saved once, there is a
+ * maximum number of contacts, and there is always exactly one primary contact while the list is
+ * non-empty. Every contact gets a private push topic when created.
+ */
 @Service
+@Transactional
 public class EmergencyContactService {
 
-    private final EmergencyContactRepository emergencyContactRepository;
+    private final EmergencyContactRepository repository;
+    private final CurrentUserService currentUserService;
+    private final PhoneNumbers phoneNumbers;
+    private final SafeRouteProperties properties;
 
-    public EmergencyContactService(EmergencyContactRepository emergencyContactRepository) {
-        this.emergencyContactRepository = emergencyContactRepository;
+    public EmergencyContactService(EmergencyContactRepository repository, CurrentUserService currentUserService,
+                                   PhoneNumbers phoneNumbers, SafeRouteProperties properties) {
+        this.repository = repository;
+        this.currentUserService = currentUserService;
+        this.phoneNumbers = phoneNumbers;
+        this.properties = properties;
     }
 
-    public List<EmergencyContact> getContactsByUser(Long userId) {
-        return emergencyContactRepository.findByUserId(userId).stream()
-                .sorted(Comparator.comparing(EmergencyContact::getCreatedAt).reversed())
-                .toList();
+    @Transactional(readOnly = true)
+    public List<EmergencyContact> listContacts() {
+        return listFor(currentUserService.currentUserId());
     }
 
-    public EmergencyContact saveContact(EmergencyContactRequest request) {
-        validateRequest(request);
+    /** Used by background jobs (alerts, trip watchdog) that know the user id but have no session. */
+    @Transactional(readOnly = true)
+    public List<EmergencyContact> listFor(Long userId) {
+        return repository.findByUserIdOrderByIsPrimaryDescCreatedAtAsc(userId);
+    }
+
+    public EmergencyContact findOwned(Long id) {
+        return repository.findByIdAndUserId(id, currentUserService.currentUserId())
+                .orElseThrow(() -> new NotFoundException("Emergency contact not found."));
+    }
+
+    public EmergencyContact create(EmergencyContactRequest request) {
+        Long userId = currentUserService.currentUserId();
+        List<EmergencyContact> existing = listFor(userId);
+        int max = properties.contacts().maxPerUser();
+        if (existing.size() >= max) {
+            throw new IllegalArgumentException("You can save up to " + max + " emergency contacts. Remove one to add another.");
+        }
+
+        String phone = phoneNumbers.normalize(request.phone(), "phone");
+        ensureUniquePhone(existing, phone, null);
 
         EmergencyContact contact = new EmergencyContact();
-        contact.setUserId(request.getUserId());
-        contact.setName(request.getName().trim());
-        contact.setPhone(normalizePhone(request.getPhone()));
-        contact.setRelation(request.getRelation().trim());
-        contact.setIsPrimary(Boolean.TRUE.equals(request.getIsPrimary()));
-        return emergencyContactRepository.save(contact);
+        contact.setUserId(userId);
+        contact.setPushTopic(Tokens.pushTopic());
+        applyFields(contact, request, phone);
+
+        boolean makePrimary = existing.isEmpty() || Boolean.TRUE.equals(request.isPrimary());
+        if (makePrimary) {
+            existing.forEach(other -> other.setIsPrimary(false));
+        }
+        contact.setIsPrimary(makePrimary);
+        return repository.save(contact);
     }
 
-    public EmergencyContact updateContact(Long contactId, EmergencyContactRequest request) {
-        validateRequest(request);
+    public EmergencyContact update(Long id, EmergencyContactRequest request) {
+        EmergencyContact contact = findOwned(id);
+        List<EmergencyContact> all = listFor(contact.getUserId());
 
-        EmergencyContact contact = emergencyContactRepository.findById(contactId)
-                .orElseThrow(() -> new IllegalArgumentException("Emergency contact not found with id: " + contactId));
-        contact.setName(request.getName().trim());
-        contact.setPhone(normalizePhone(request.getPhone()));
-        contact.setRelation(request.getRelation().trim());
-        contact.setIsPrimary(Boolean.TRUE.equals(request.getIsPrimary()));
-        return emergencyContactRepository.save(contact);
+        String phone = phoneNumbers.normalize(request.phone(), "phone");
+        ensureUniquePhone(all, phone, id);
+        applyFields(contact, request, phone);
+        if (contact.getPushTopic() == null) {
+            contact.setPushTopic(Tokens.pushTopic());
+        }
+
+        if (Boolean.TRUE.equals(request.isPrimary()) && !Boolean.TRUE.equals(contact.getIsPrimary())) {
+            all.forEach(other -> other.setIsPrimary(false));
+            contact.setIsPrimary(true);
+        }
+        return contact;
     }
 
-    public void deleteContact(Long contactId) {
-        if (!emergencyContactRepository.existsById(contactId)) {
-            throw new IllegalArgumentException("Emergency contact not found with id: " + contactId);
-        }
-        emergencyContactRepository.deleteById(contactId);
-    }
+    public void delete(Long id) {
+        EmergencyContact contact = findOwned(id);
+        repository.delete(contact);
+        repository.flush();
 
-    private void validateRequest(EmergencyContactRequest request) {
-        if (request == null) {
-            throw new IllegalArgumentException("Emergency contact request is required.");
-        }
-        if (request.getUserId() == null) {
-            throw new IllegalArgumentException("User id is required.");
-        }
-        if (request.getName() == null || request.getName().isBlank()) {
-            throw new IllegalArgumentException("Contact name is required.");
-        }
-        if (request.getName().trim().length() < 2) {
-            throw new IllegalArgumentException("Contact name must be at least 2 characters long.");
-        }
-        if (request.getPhone() == null || request.getPhone().isBlank()) {
-            throw new IllegalArgumentException("Phone number is required.");
-        }
-        String normalizedPhone = normalizePhone(request.getPhone());
-        if (normalizedPhone.length() < 8 || !normalizedPhone.matches("[+0-9]+")) {
-            throw new IllegalArgumentException("Enter a valid phone number with at least 8 digits.");
-        }
-        if (request.getRelation() == null || request.getRelation().isBlank()) {
-            throw new IllegalArgumentException("Relationship is required.");
+        if (Boolean.TRUE.equals(contact.getIsPrimary())) {
+            listFor(contact.getUserId()).stream()
+                    .min((a, b) -> a.getCreatedAt().compareTo(b.getCreatedAt()))
+                    .ifPresent(oldest -> oldest.setIsPrimary(true));
         }
     }
 
-    private String normalizePhone(String phone) {
-        if (phone == null) {
-            return "";
+    private void ensureUniquePhone(List<EmergencyContact> contacts, String phone, Long ignoreId) {
+        boolean duplicate = contacts.stream()
+                .anyMatch(other -> phone.equals(other.getPhone()) && !other.getId().equals(ignoreId));
+        if (duplicate) {
+            throw new FieldValidationException("phone", "This number is already saved as an emergency contact.");
         }
-        String digits = phone.replaceAll("[^+\\d]", "");
-        return digits.isEmpty() ? phone.trim() : digits;
+    }
+
+    private static void applyFields(EmergencyContact contact, EmergencyContactRequest request, String phone) {
+        contact.setName(request.name().trim());
+        contact.setPhone(phone);
+        contact.setRelation(request.relation().trim());
+        String email = request.email() == null ? "" : request.email().trim().toLowerCase(Locale.ROOT);
+        contact.setEmail(email.isEmpty() ? null : email);
     }
 }

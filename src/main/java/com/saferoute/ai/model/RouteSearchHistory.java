@@ -1,8 +1,18 @@
 package com.saferoute.ai.model;
 
-import jakarta.persistence.*;
 import java.time.LocalDateTime;
 
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.PrePersist;
+import jakarta.persistence.Table;
+
+/** One past route search and the route that was recommended for it. */
 @Entity
 @Table(name = "route_search_history")
 public class RouteSearchHistory {
@@ -20,14 +30,27 @@ public class RouteSearchHistory {
     @Column(name = "destination_location", nullable = false)
     private String destinationLocation;
 
+    @Column(name = "source_latitude")
+    private Double sourceLatitude;
+
+    @Column(name = "source_longitude")
+    private Double sourceLongitude;
+
+    @Column(name = "destination_latitude")
+    private Double destinationLatitude;
+
+    @Column(name = "destination_longitude")
+    private Double destinationLongitude;
+
     @Column(name = "route_label", nullable = false)
     private String routeLabel;
 
     @Column(name = "safety_score")
     private Double safetyScore;
 
-    @Column(name = "risk_level")
-    private String riskLevel;
+    @Enumerated(EnumType.STRING)
+    @Column(name = "risk_level", length = 20)
+    private RiskLevel riskLevel;
 
     @Column(name = "travel_time_minutes")
     private Integer travelTimeMinutes;
@@ -45,10 +68,6 @@ public class RouteSearchHistory {
 
     public Long getId() {
         return id;
-    }
-
-    public void setId(Long id) {
-        this.id = id;
     }
 
     public Long getUserId() {
@@ -75,6 +94,32 @@ public class RouteSearchHistory {
         this.destinationLocation = destinationLocation;
     }
 
+    public Double getSourceLatitude() {
+        return sourceLatitude;
+    }
+
+    public Double getSourceLongitude() {
+        return sourceLongitude;
+    }
+
+    public Double getDestinationLatitude() {
+        return destinationLatitude;
+    }
+
+    public Double getDestinationLongitude() {
+        return destinationLongitude;
+    }
+
+    public void setSourcePoint(double latitude, double longitude) {
+        this.sourceLatitude = latitude;
+        this.sourceLongitude = longitude;
+    }
+
+    public void setDestinationPoint(double latitude, double longitude) {
+        this.destinationLatitude = latitude;
+        this.destinationLongitude = longitude;
+    }
+
     public String getRouteLabel() {
         return routeLabel;
     }
@@ -91,11 +136,11 @@ public class RouteSearchHistory {
         this.safetyScore = safetyScore;
     }
 
-    public String getRiskLevel() {
+    public RiskLevel getRiskLevel() {
         return riskLevel;
     }
 
-    public void setRiskLevel(String riskLevel) {
+    public void setRiskLevel(RiskLevel riskLevel) {
         this.riskLevel = riskLevel;
     }
 
@@ -117,9 +162,5 @@ public class RouteSearchHistory {
 
     public LocalDateTime getCreatedAt() {
         return createdAt;
-    }
-
-    public void setCreatedAt(LocalDateTime createdAt) {
-        this.createdAt = createdAt;
     }
 }

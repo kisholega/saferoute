@@ -1,53 +1,55 @@
 package com.saferoute.ai.service;
 
-import com.saferoute.ai.dto.SafeLocation;
-import org.springframework.stereotype.Service;
-
-import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 
+import org.springframework.stereotype.Service;
+
+import com.saferoute.ai.dto.SafeLocation;
+import com.saferoute.ai.exception.ExternalServiceException;
+import com.saferoute.ai.geo.GeoPoint;
+import com.saferoute.ai.geo.GeoUtils;
+import com.saferoute.ai.service.safety.OsmSafetyDataService;
+import com.saferoute.ai.service.safety.SafetyData;
+
+/** Real places to get help near a point, live from OpenStreetMap: police, hospitals, clinics, pharmacies, fuel. */
 @Service
 public class SafeLocationService {
 
-    public List<SafeLocation> findNearbySafeLocations(double latitude, double longitude) {
-        List<SafeLocation> locations = new ArrayList<>();
+    static final int MAX_RADIUS_METERS = 5000;
 
-        SafeLocation police = new SafeLocation();
-        police.setName("Sample Police Station");
-        police.setType("POLICE");
-        police.setLatitude(12.9762);
-        police.setLongitude(77.6033);
-        police.setDistanceKm(0.9);
-        police.setDescription("Demo location only. This is not a verified real facility.");
-        locations.add(police);
+    private final OsmSafetyDataService safetyDataService;
 
-        SafeLocation hospital = new SafeLocation();
-        hospital.setName("Sample Hospital");
-        hospital.setType("HOSPITAL");
-        hospital.setLatitude(12.9798);
-        hospital.setLongitude(77.6084);
-        hospital.setDistanceKm(1.2);
-        hospital.setDescription("Demo location only. This is not a verified real facility.");
-        locations.add(hospital);
+    public SafeLocationService(OsmSafetyDataService safetyDataService) {
+        this.safetyDataService = safetyDataService;
+    }
 
-        SafeLocation pharmacy = new SafeLocation();
-        pharmacy.setName("Sample Pharmacy");
-        pharmacy.setType("PHARMACY");
-        pharmacy.setLatitude(12.9729);
-        pharmacy.setLongitude(77.6008);
-        pharmacy.setDistanceKm(0.7);
-        pharmacy.setDescription("Demo location only. This is not a verified real facility.");
-        locations.add(pharmacy);
+    public List<SafeLocation> findNearby(double latitude, double longitude, int radiusMeters) {
+        GeoPoint origin = new GeoPoint(latitude, longitude);
+        int radius = Math.max(200, Math.min(MAX_RADIUS_METERS, radiusMeters));
+        SafetyData data = safetyDataService.helpAround(origin, radius);
+        if (!data.live()) {
+            throw new ExternalServiceException("Live places from OpenStreetMap are unavailable right now. Try again shortly.", null);
+        }
+        return data.help().stream()
+                .map(poi -> new SafeLocation(
+                        poi.name().isBlank() ? defaultName(poi.kind()) : poi.name(),
+                        poi.kind(), poi.lat(), poi.lon(),
+                        Math.round(GeoUtils.distanceMeters(origin, poi.point()) / 10.0) / 100.0,
+                        poi.open24h()))
+                .sorted(Comparator.comparingDouble(SafeLocation::distanceKm))
+                .limit(60)
+                .toList();
+    }
 
-        SafeLocation publicSpace = new SafeLocation();
-        publicSpace.setName("Sample Public Plaza");
-        publicSpace.setType("PUBLIC_PLACE");
-        publicSpace.setLatitude(12.9778);
-        publicSpace.setLongitude(77.5949);
-        publicSpace.setDistanceKm(1.1);
-        publicSpace.setDescription("Demo location only. This is not a verified real facility.");
-        locations.add(publicSpace);
-
-        return locations;
+    private static String defaultName(String kind) {
+        return switch (kind) {
+            case "POLICE" -> "Police station";
+            case "HOSPITAL" -> "Hospital";
+            case "CLINIC" -> "Clinic";
+            case "PHARMACY" -> "Pharmacy";
+            case "FUEL" -> "Fuel station";
+            default -> "Help point";
+        };
     }
 }

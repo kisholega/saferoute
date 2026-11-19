@@ -1,397 +1,251 @@
 package com.saferoute.ai.service;
 
+import java.time.Clock;
 import java.time.LocalDateTime;
-import java.time.LocalTime;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpMethod;
-import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
-import org.springframework.web.client.RestTemplate;
-import org.springframework.web.util.UriComponentsBuilder;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.saferoute.ai.dto.RiskPredictionRequest;
-import com.saferoute.ai.dto.RiskPredictionResponse;
+import com.saferoute.ai.client.RouteCandidate;
+import com.saferoute.ai.config.SafeRouteProperties;
+import com.saferoute.ai.dto.Place;
 import com.saferoute.ai.dto.RouteOption;
 import com.saferoute.ai.dto.RouteRecommendationRequest;
 import com.saferoute.ai.dto.RouteRecommendationResponse;
+import com.saferoute.ai.dto.ZoneHit;
+import com.saferoute.ai.geo.GeoPoint;
+import com.saferoute.ai.geo.GeoUtils;
+import com.saferoute.ai.model.IncidentReport;
+import com.saferoute.ai.model.RiskLevel;
 import com.saferoute.ai.model.RouteSearchHistory;
+import com.saferoute.ai.model.TravelMode;
 import com.saferoute.ai.repository.RouteSearchHistoryRepository;
-import com.saferoute.ai.repository.SafetyZoneRepository;
+import com.saferoute.ai.service.RoutingService.RoutingResult;
+import com.saferoute.ai.service.safety.OsmSafetyDataService;
+import com.saferoute.ai.service.safety.RouteSafetyAnalyzer;
+import com.saferoute.ai.service.safety.RouteSafetyAnalyzer.Analysis;
+import com.saferoute.ai.service.safety.SafetyData;
+import com.saferoute.ai.service.safety.SegmentFeatureExtractor;
 
+/**
+ * The core use case: find candidate routes, score each one stretch by stretch, and recommend the safest.
+ *
+ * <pre>
+ * resolve places ─► routes (OSRM walk/car + safe detours) ─► one OpenStreetMap corridor query
+ *   ─► features every 120 m (lighting, people, isolation, help, incidents, hour) ─► Random Forest
+ *   ─► score, coloured stretches, highlights, help points ─► safest route recommended ─► history
+ * </pre>
+ */
 @Service
 public class RouteRecommendationService {
 
-    private final RiskPredictionService riskPredictionService;
-    private final SafetyZoneRepository safetyZoneRepository;
-    private final RouteSearchHistoryRepository routeSearchHistoryRepository;
-    private final RestTemplate restTemplate;
-    private final ObjectMapper objectMapper = new ObjectMapper();
+    static final double MIN_TRIP_METERS = 50;
 
-    private static final Map<String, GeocodeResult> OFFLINE_LOCATIONS = Map.ofEntries(
-            Map.entry("campus gate", new GeocodeResult(12.9715, 77.5945, "Campus Gate")),
-            Map.entry("city library", new GeocodeResult(12.9688, 77.5984, "City Library")),
-            Map.entry("central park", new GeocodeResult(40.7829, -73.9654, "Central Park")),
-            Map.entry("main station", new GeocodeResult(12.9843, 77.5839, "Main Station")),
-            Map.entry("home", new GeocodeResult(12.9716, 77.5946, "Home")),
-            Map.entry("office", new GeocodeResult(12.9724, 77.5923, "Office")),
-            Map.entry("hospital", new GeocodeResult(12.9847, 77.5859, "Hospital")),
-            Map.entry("police station", new GeocodeResult(12.9710, 77.5878, "Police Station"))
-    );
+    private final GeocodingService geocodingService;
+    private final RoutingService routingService;
+    private final OsmSafetyDataService safetyDataService;
+    private final RouteSafetyAnalyzer analyzer;
+    private final SafetyZoneService safetyZoneService;
+    private final ReportService reportService;
+    private final RouteSearchHistoryRepository historyRepository;
+    private final CurrentUserService currentUserService;
+    private final SafeRouteProperties properties;
+    private final Clock clock;
 
-    @Value("${saferoute.osrm.base-url:http://router.project-osrm.org}")
-    private String osrmBaseUrl;
-
-    public RouteRecommendationService(
-            RiskPredictionService riskPredictionService,
-            SafetyZoneRepository safetyZoneRepository,
-            RouteSearchHistoryRepository routeSearchHistoryRepository,
-            RestTemplate restTemplate) {
-        this.riskPredictionService = riskPredictionService;
-        this.safetyZoneRepository = safetyZoneRepository;
-        this.routeSearchHistoryRepository = routeSearchHistoryRepository;
-        this.restTemplate = restTemplate;
+    public RouteRecommendationService(GeocodingService geocodingService, RoutingService routingService,
+                                      OsmSafetyDataService safetyDataService, RouteSafetyAnalyzer analyzer,
+                                      SafetyZoneService safetyZoneService, ReportService reportService,
+                                      RouteSearchHistoryRepository historyRepository,
+                                      CurrentUserService currentUserService, SafeRouteProperties properties,
+                                      Clock clock) {
+        this.geocodingService = geocodingService;
+        this.routingService = routingService;
+        this.safetyDataService = safetyDataService;
+        this.analyzer = analyzer;
+        this.safetyZoneService = safetyZoneService;
+        this.reportService = reportService;
+        this.historyRepository = historyRepository;
+        this.currentUserService = currentUserService;
+        this.properties = properties;
+        this.clock = clock;
     }
 
     public RouteRecommendationResponse recommend(RouteRecommendationRequest request) {
-        if (request == null) {
-            throw new IllegalArgumentException("Route request is required.");
-        }
-        if (request.getSource() == null || request.getSource().isBlank()) {
-            throw new IllegalArgumentException("Source is required.");
-        }
-        if (request.getDestination() == null || request.getDestination().isBlank()) {
-            throw new IllegalArgumentException("Destination is required.");
+        Long userId = currentUserService.currentUserId();
+        int hour = TravelTimeParser.hourOf(request.travelTime());
+        TravelMode mode = request.mode() == null ? TravelMode.WALK : request.mode();
+        Place source = resolve(request.source(), request.sourceLatitude(), request.sourceLongitude());
+        Place destination = resolve(request.destination(), request.destinationLatitude(), request.destinationLongitude());
+        validateTrip(source, destination);
+
+        RoutingResult routing = routingService.findRoutes(source.point(), destination.point(), mode);
+        List<RouteCandidate> candidates = routing.candidates();
+
+        SafetyData data = routing.estimated()
+                ? SafetyData.unavailable()
+                : safetyDataService.alongRoutes(candidates.stream().map(RouteCandidate::geometry).toList());
+        List<IncidentReport> reports = reportService.reportsAround(candidates);
+        SegmentFeatureExtractor extractor = new SegmentFeatureExtractor(hour, data,
+                safetyZoneService.getActiveZones(), reports, LocalDateTime.now(clock));
+
+        List<Scored> scored = new ArrayList<>();
+        for (RouteCandidate candidate : candidates) {
+            Analysis analysis = analyzer.analyze(candidate.geometry(), extractor, data.help());
+            scored.add(new Scored(candidate, analysis, safetyZoneService.zonesAlongRoute(candidate.geometry())));
         }
 
-        GeocodeResult source = resolveGeocodeResult(request.getSource(), request.getSourceLatitude(), request.getSourceLongitude(), request.getSourceDisplayName());
-        GeocodeResult destination = resolveGeocodeResult(request.getDestination(), request.getDestinationLatitude(), request.getDestinationLongitude(), request.getDestinationDisplayName());
+        Scored recommended = scored.stream()
+                .max(Comparator.comparingDouble((Scored s) -> s.analysis().safetyScore())
+                        .thenComparing(Comparator.comparingDouble((Scored s) -> s.candidate().durationSeconds()).reversed()))
+                .orElseThrow();
+        Scored fastest = scored.stream().min(Comparator.comparingDouble((Scored s) -> s.candidate().durationSeconds())).orElseThrow();
 
-        List<RouteOption> routes = fetchRoutesForLocations(source, destination, request);
-        if (routes == null || routes.isEmpty()) {
-            throw new IllegalArgumentException("No valid route could be generated for the selected start and destination.");
+        String dataQuality = data.live() ? "live" : "estimated";
+        List<RouteOption> options = new ArrayList<>();
+        for (int i = 0; i < scored.size(); i++) {
+            Scored s = scored.get(i);
+            options.add(toOption(s, i, scored.size(), s == recommended, s == fastest, routing.estimated(), dataQuality));
         }
+        RouteOption best = options.get(scored.indexOf(recommended));
+        saveHistory(userId, source, destination, best);
 
-        RouteOption recommended = routes.stream()
-                .max(Comparator.comparing(RouteOption::getSafetyScore))
-                .orElse(routes.get(0));
+        return new RouteRecommendationResponse(source, destination, options, best.routeId(), mode,
+                routing.estimated(), dataQuality, buildMessage(routing.estimated(), data.live(), options.size()), hour);
+    }
 
+    /** Safety score of one route for one departure hour. */
+    public record HourScore(int hour, double safetyScore, RiskLevel riskLevel) {
+    }
+
+    /**
+     * "Best time to leave": scores the same route for each of the next {@code hours} departure hours,
+     * starting at {@code startHour}. Street data is fetched once; only the time-of-day features change.
+     */
+    public List<HourScore> timeProfile(List<List<Double>> geometry, int startHour, int hours) {
+        currentUserService.currentUserId();
+        if (geometry == null || geometry.size() < 2) {
+            throw new IllegalArgumentException("A route needs at least two points.");
+        }
+        if (startHour < 0 || startHour > 23) {
+            throw new IllegalArgumentException("Start hour must be between 0 and 23.");
+        }
+        int count = Math.max(1, Math.min(24, hours));
+        List<GeoPoint> points = geometry.stream().map(pair -> new GeoPoint(pair.get(0), pair.get(1))).toList();
+        SafetyData data = safetyDataService.alongRoutes(List.of(points));
+        List<IncidentReport> reports = reportService.reportsAround(List.of(new RouteCandidate(0, 0, points)));
+        LocalDateTime now = LocalDateTime.now(clock);
+        List<HourScore> profile = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            int hour = (startHour + i) % 24;
+            SegmentFeatureExtractor extractor = new SegmentFeatureExtractor(hour, data,
+                    safetyZoneService.getActiveZones(), reports, now);
+            double score = analyzer.score(points, extractor);
+            profile.add(new HourScore(hour, score, RiskLevel.fromSafetyScore(score)));
+        }
+        return profile;
+    }
+
+    private Place resolve(String text, Double latitude, Double longitude) {
+        if (latitude != null && longitude != null) {
+            GeoPoint point = new GeoPoint(latitude, longitude); // validates the range
+            return new Place(text.trim(), text.trim(), point.lat(), point.lon(), "user");
+        }
+        return geocodingService.resolve(text);
+    }
+
+    private void validateTrip(Place source, Place destination) {
+        double meters = GeoUtils.distanceMeters(source.point(), destination.point());
+        if (meters < MIN_TRIP_METERS) {
+            throw new IllegalArgumentException("The start and destination are the same place. Choose a different destination.");
+        }
+        double maxKm = properties.routing().maxTripKm();
+        if (meters / 1000.0 > maxKm) {
+            throw new IllegalArgumentException(String.format(java.util.Locale.ROOT,
+                    "SafeRoute AI plans trips within a city (up to %.0f km). These places are %.0f km apart.",
+                    maxKm, meters / 1000.0));
+        }
+    }
+
+    private static RouteOption toOption(Scored s, int index, int total, boolean isRecommended, boolean isFastest,
+                                        boolean estimatedRoute, String dataQuality) {
+        List<String> tags = new ArrayList<>();
+        if (isRecommended) {
+            tags.add("Recommended");
+        }
+        if (isFastest && total > 1) {
+            tags.add("Fastest");
+        }
+        Analysis a = s.analysis();
+        RiskLevel level = RiskLevel.fromSafetyScore(a.safetyScore());
+        return new RouteOption(
+                estimatedRoute ? "estimate" : "route-" + (index + 1),
+                estimatedRoute ? "Straight-line estimate" : "Route " + (char) ('A' + index),
+                tags,
+                Math.round(s.candidate().distanceMeters() / 10.0) / 100.0,
+                Math.max(1, (int) Math.round(s.candidate().durationSeconds() / 60.0)),
+                a.safetyScore(),
+                Math.round(a.riskProbability() * 1000.0) / 10.0,
+                level,
+                a.factors(),
+                s.zones(),
+                a.segments(),
+                a.highlights(),
+                a.helpPoints(),
+                a.weakest(),
+                buildWarning(level, s, estimatedRoute),
+                dataQuality,
+                estimatedRoute,
+                s.candidate().geometry().stream().map(GeoPoint::toLatLon).toList());
+    }
+
+    private static String buildWarning(RiskLevel level, Scored s, boolean estimatedRoute) {
+        if (estimatedRoute) {
+            return "Live routing is unavailable. This straight line only approximates the trip; follow real roads.";
+        }
+        if (!s.zones().isEmpty()) {
+            ZoneHit worst = s.zones().get(0);
+            return "Passes through " + worst.name() + " (" + worst.riskLevel().getLabel() + ").";
+        }
+        if (s.analysis().weakest() != null && level != RiskLevel.LOW) {
+            return "Weakest part: " + s.analysis().weakest().description() + ".";
+        }
+        return switch (level) {
+            case HIGH -> "Higher estimated risk. Prefer a busier, better-lit option if you can.";
+            case MEDIUM -> "Moderate risk. Stay alert on the quieter stretches.";
+            case LOW -> "Well lit, busy and close to help for most of the way.";
+        };
+    }
+
+    private static String buildMessage(boolean estimatedRoute, boolean live, int routeCount) {
+        if (estimatedRoute) {
+            return "Live routing is unavailable, so this is a straight-line estimate.";
+        }
+        String base = routeCount == 1 ? "Only one practical route was found." : "Compared " + routeCount + " routes.";
+        return live ? base + " Scored with live street data from OpenStreetMap."
+                : base + " Street data was unavailable, so scores are estimated.";
+    }
+
+    private void saveHistory(Long userId, Place source, Place destination, RouteOption recommended) {
         RouteSearchHistory history = new RouteSearchHistory();
-        history.setUserId(request.getUserId() != null ? request.getUserId() : 1L);
-        history.setSourceLocation(request.getSource());
-        history.setDestinationLocation(request.getDestination());
-        history.setRouteLabel(recommended.getLabel());
-        history.setSafetyScore(recommended.getSafetyScore());
-        history.setRiskLevel(recommended.getRiskLevel());
-        history.setTravelTimeMinutes(recommended.getTravelTimeMinutes());
-        history.setDistanceKm(recommended.getDistanceKm());
-        routeSearchHistoryRepository.save(history);
-
-        RouteRecommendationResponse response = new RouteRecommendationResponse();
-        response.setSource(request.getSource());
-        response.setDestination(request.getDestination());
-        response.setRoutes(routes);
-        response.setRecommendedRoute(recommended);
-        response.setDemoMode(routes.stream().anyMatch(route -> Boolean.TRUE.equals(route.getDemoMode())));
-        response.setMessage(response.getDemoMode() ? "Live routing was unavailable, so a geocoded fallback route is being shown for demonstration use only." : "Live OSRM route data and safety scoring are active for this request.");
-        return response;
+        history.setUserId(userId);
+        history.setSourceLocation(truncate(source.name()));
+        history.setDestinationLocation(truncate(destination.name()));
+        history.setSourcePoint(source.latitude(), source.longitude());
+        history.setDestinationPoint(destination.latitude(), destination.longitude());
+        history.setRouteLabel(recommended.label());
+        history.setSafetyScore(recommended.safetyScore());
+        history.setRiskLevel(recommended.riskLevel());
+        history.setTravelTimeMinutes(recommended.travelTimeMinutes());
+        history.setDistanceKm(recommended.distanceKm());
+        historyRepository.save(history);
     }
 
-    private List<RouteOption> fetchRoutesForLocations(GeocodeResult source, GeocodeResult destination, RouteRecommendationRequest request) {
-        try {
-            String routeUrl = UriComponentsBuilder.fromHttpUrl(osrmBaseUrl)
-                    .path("/route/v1/driving/{lon1},{lat1};{lon2},{lat2}")
-                    .queryParam("alternatives", "true")
-                    .queryParam("geometries", "geojson")
-                    .queryParam("overview", "full")
-                    .queryParam("steps", "false")
-                    .buildAndExpand(source.lon(), source.lat(), destination.lon(), destination.lat())
-                    .toUriString();
-
-            ResponseEntity<String> response = restTemplate.getForEntity(routeUrl, String.class);
-            JsonNode root = objectMapper.readTree(response.getBody());
-            JsonNode routesNode = root.get("routes");
-            if (routesNode == null || !routesNode.isArray() || routesNode.isEmpty()) {
-                return buildFallbackRoutes(source, destination, request, "No route geometry was returned from the routing service.");
-            }
-
-            List<RouteOption> routes = new ArrayList<>();
-            for (int index = 0; index < routesNode.size(); index++) {
-                JsonNode routeNode = routesNode.get(index);
-                double distanceKm = routeNode.path("distance").asDouble() / 1000.0;
-                int durationMinutes = Math.max(1, (int) Math.round(routeNode.path("duration").asDouble() / 60.0));
-                JsonNode geometryNode = routeNode.path("geometry").path("coordinates");
-                List<List<Double>> geometry = new ArrayList<>();
-                if (geometryNode.isArray()) {
-                    for (JsonNode pointNode : geometryNode) {
-                        if (pointNode.size() >= 2) {
-                            double lon = pointNode.get(0).asDouble();
-                            double lat = pointNode.get(1).asDouble();
-                            geometry.add(List.of(lat, lon));
-                        }
-                    }
-                }
-                if (geometry.isEmpty()) {
-                    geometry = interpolateGeometry(source, destination);
-                }
-
-                RiskPredictionRequest riskRequest = buildRiskRequest(request, source, destination, distanceKm, durationMinutes, index, routesNode.size());
-                RiskPredictionResponse riskResponse = riskPredictionService.predictRisk(riskRequest);
-
-                RouteOption option = new RouteOption();
-                option.setRouteId("route-" + (index + 1));
-                option.setLabel(index == 0 ? "Recommended route" : "Alternative route " + (index + 1));
-                option.setDistanceKm(round(distanceKm));
-                option.setTravelTimeMinutes(durationMinutes);
-                option.setSafetyScore(round(riskResponse.getSafetyScore()));
-                option.setRiskProbability(round(riskResponse.getRiskProbability()));
-                option.setRiskLevel(riskResponse.getRiskLevel());
-                option.setWarning(buildWarning(riskResponse.getRiskLevel()));
-                option.setDemoMode(false);
-                option.setGeometry(geometry);
-                routes.add(option);
-            }
-
-            return routes;
-        } catch (Exception ex) {
-            return buildFallbackRoutes(source, destination, request, ex.getMessage());
-        }
+    private static String truncate(String value) {
+        return value.length() <= 255 ? value : value.substring(0, 255);
     }
 
-    private List<RouteOption> buildFallbackRoutes(GeocodeResult source, GeocodeResult destination, RouteRecommendationRequest request, String message) {
-        List<List<Double>> geometry = interpolateGeometry(source, destination);
-        RiskPredictionRequest riskRequest = buildRiskRequest(request, source, destination, 4.8, 22, 0, 1);
-        RiskPredictionResponse riskResponse = riskPredictionService.predictRisk(riskRequest);
-
-        RouteOption fallback = new RouteOption();
-        fallback.setRouteId("route-1");
-        fallback.setLabel("Direct route fallback");
-        fallback.setDistanceKm(round(4.8));
-        fallback.setTravelTimeMinutes(22);
-        fallback.setSafetyScore(round(riskResponse.getSafetyScore()));
-        fallback.setRiskProbability(round(riskResponse.getRiskProbability()));
-        fallback.setRiskLevel(riskResponse.getRiskLevel());
-        fallback.setWarning("Live routing is unavailable. This route is a geocoded fallback using the requested start and destination coordinates and should be treated as a demonstration estimate only.");
-        fallback.setDemoMode(true);
-        fallback.setGeometry(geometry);
-        return List.of(fallback);
-    }
-
-    private RiskPredictionRequest buildRiskRequest(RouteRecommendationRequest request,
-                                                 GeocodeResult source,
-                                                 GeocodeResult destination,
-                                                 double distanceKm,
-                                                 int durationMinutes,
-                                                 int index,
-                                                 int totalAlternatives) {
-        int hourOfDay = resolveHourOfDay(request.getTravelTime(), request.getTravelDate());
-        boolean isNight = hourOfDay >= 19 || hourOfDay <= 5;
-
-        RiskPredictionRequest riskRequest = new RiskPredictionRequest();
-        riskRequest.setSourceLocation(source.displayName());
-        riskRequest.setDestinationLocation(destination.displayName());
-        riskRequest.setTimeOfTravel(hourOfDay);
-        riskRequest.setLightingCondition(isNight ? 2 : 4);
-        riskRequest.setCrowdDensity(Math.min(5, Math.max(1, (int) Math.round(4.0 - (distanceKm / 10.0) + (totalAlternatives > 1 ? 1 : 0)))));
-        riskRequest.setReportedIncidentCount(Math.min(10, Math.max(0, isNight ? 2 : 1 + index)));
-        riskRequest.setRoadIsolationLevel(Math.min(5, Math.max(1, (int) Math.round(2 + (distanceKm / 3.0)))));
-        riskRequest.setDistanceToPoliceStation(Math.min(20.0, Math.max(0.3, distanceKm / 4.0)));
-        riskRequest.setDistanceToHospital(Math.min(20.0, Math.max(0.4, distanceKm / 3.0)));
-        riskRequest.setNearbyPublicPlaces(Math.min(10, Math.max(1, (int) Math.round(6 - (distanceKm / 3.0)))));
-        return riskRequest;
-    }
-
-    private int resolveHourOfDay(String travelTimeValue, String travelDateValue) {
-        if (travelTimeValue == null || travelTimeValue.isBlank()) {
-            return LocalDateTime.now().getHour();
-        }
-        String normalized = travelTimeValue.trim();
-        if ("DAY".equalsIgnoreCase(normalized)) {
-            return 9;
-        }
-        if ("NIGHT".equalsIgnoreCase(normalized)) {
-            return 21;
-        }
-        if (normalized.matches(".*[AaPp][Mm]")) {
-            return LocalTime.parse(normalized, DateTimeFormatter.ofPattern("h:mm a")).getHour();
-        }
-        if (normalized.matches("\\d{1,2}:\\d{2}")) {
-            return LocalTime.parse(normalized, DateTimeFormatter.ofPattern("H:mm")).getHour();
-        }
-        if (normalized.matches("\\d{4}-\\d{2}-\\d{2}T.*")) {
-            return LocalDateTime.parse(normalized).getHour();
-        }
-        return LocalDateTime.now().getHour();
-    }
-
-    private List<List<Double>> interpolateGeometry(GeocodeResult source, GeocodeResult destination) {
-        List<List<Double>> coordinates = new ArrayList<>();
-        int steps = 5;
-        for (int i = 0; i <= steps; i++) {
-            double ratio = steps == 0 ? 0.0 : (double) i / steps;
-            double lat = source.lat() + (destination.lat() - source.lat()) * ratio;
-            double lon = source.lon() + (destination.lon() - source.lon()) * ratio;
-            coordinates.add(List.of(lat, lon));
-        }
-        return coordinates;
-    }
-
-    public List<Map<String, Object>> searchLocations(String query) {
-        String cleaned = query == null ? "" : query.trim();
-        if (cleaned.isEmpty()) {
-            throw new IllegalArgumentException("Search query is required.");
-        }
-
-        try {
-            String geocodeUrl = UriComponentsBuilder.fromHttpUrl("https://nominatim.openstreetmap.org/search")
-                    .queryParam("format", "jsonv2")
-                    .queryParam("limit", "5")
-                    .queryParam("q", cleaned)
-                    .queryParam("addressdetails", "1")
-                    .build()
-                    .toUriString();
-
-            HttpHeaders headers = new HttpHeaders();
-            headers.set("User-Agent", "SafeRouteAI/1.0 (saferoute.ai.demo@example.com)");
-            headers.set("Accept-Language", "en");
-            HttpEntity<Void> requestEntity = new HttpEntity<>(headers);
-
-            ResponseEntity<String> response = restTemplate.exchange(geocodeUrl, HttpMethod.GET, requestEntity, String.class);
-            JsonNode results = objectMapper.readTree(response.getBody());
-            if (response.getStatusCode().isError() || results == null || !results.isArray() || results.isEmpty()) {
-                return buildOfflineSearchResults(cleaned);
-            }
-
-            List<Map<String, Object>> matches = new ArrayList<>();
-            for (JsonNode item : results) {
-                if (item == null || item.path("lat").isMissingNode() || item.path("lon").isMissingNode()) {
-                    continue;
-                }
-                Map<String, Object> match = new HashMap<>();
-                match.put("displayName", item.path("display_name").asText(cleaned));
-                match.put("name", item.path("name").asText(cleaned));
-                match.put("address", item.path("address").toString());
-                match.put("latitude", item.path("lat").asDouble());
-                match.put("longitude", item.path("lon").asDouble());
-                matches.add(match);
-            }
-
-            if (matches.isEmpty()) {
-                return buildOfflineSearchResults(cleaned);
-            }
-            return matches;
-        } catch (Exception ex) {
-            return buildOfflineSearchResults(cleaned);
-        }
-    }
-
-    private GeocodeResult resolveGeocodeResult(String locationText, Double latitudeOverride, Double longitudeOverride, String displayNameOverride) {
-        if (latitudeOverride != null && longitudeOverride != null) {
-            return new GeocodeResult(latitudeOverride, longitudeOverride, displayNameOverride == null || displayNameOverride.isBlank() ? locationText : displayNameOverride);
-        }
-        return geocodeLocation(locationText);
-    }
-
-    private GeocodeResult geocodeLocation(String locationText) {
-        String cleaned = locationText == null ? "" : locationText.trim();
-        if (cleaned.isEmpty()) {
-            throw new IllegalArgumentException("Location is required.");
-        }
-
-        try {
-            String geocodeUrl = UriComponentsBuilder.fromHttpUrl("https://nominatim.openstreetmap.org/search")
-                    .queryParam("format", "jsonv2")
-                    .queryParam("limit", "5")
-                    .queryParam("q", cleaned)
-                    .queryParam("addressdetails", "1")
-                    .build()
-                    .toUriString();
-
-            HttpHeaders headers = new HttpHeaders();
-            headers.set("User-Agent", "SafeRouteAI/1.0 (saferoute.ai.demo@example.com)");
-            headers.set("Accept-Language", "en");
-            HttpEntity<Void> requestEntity = new HttpEntity<>(headers);
-
-            ResponseEntity<String> response = restTemplate.exchange(geocodeUrl, HttpMethod.GET, requestEntity, String.class);
-            JsonNode results = objectMapper.readTree(response.getBody());
-            if (response.getStatusCode().isError() || results == null || !results.isArray() || results.isEmpty()) {
-                return resolveOfflineGeocodeResult(cleaned);
-            }
-
-            JsonNode firstMatch = results.get(0);
-            double latitude = firstMatch.path("lat").asDouble();
-            double longitude = firstMatch.path("lon").asDouble();
-            String displayName = firstMatch.path("display_name").asText(cleaned);
-            return new GeocodeResult(latitude, longitude, displayName);
-        } catch (Exception ex) {
-            return resolveOfflineGeocodeResult(cleaned);
-        }
-    }
-
-    private List<Map<String, Object>> buildOfflineSearchResults(String query) {
-        String normalized = query == null ? "" : query.trim().toLowerCase();
-        List<Map<String, Object>> results = new ArrayList<>();
-        for (Map.Entry<String, GeocodeResult> entry : OFFLINE_LOCATIONS.entrySet()) {
-            String key = entry.getKey();
-            if (normalized.isBlank() || key.contains(normalized) || normalized.contains(key)) {
-                GeocodeResult geocodeResult = entry.getValue();
-                Map<String, Object> match = new HashMap<>();
-                match.put("displayName", geocodeResult.displayName());
-                match.put("name", geocodeResult.displayName());
-                match.put("address", "Offline location match");
-                match.put("latitude", geocodeResult.lat());
-                match.put("longitude", geocodeResult.lon());
-                results.add(match);
-            }
-        }
-        if (results.isEmpty()) {
-            Map<String, Object> match = new HashMap<>();
-            match.put("displayName", query);
-            match.put("name", query);
-            match.put("address", "Exact fallback coordinate unavailable");
-            match.put("latitude", 12.9716);
-            match.put("longitude", 77.5946);
-            results.add(match);
-        }
-        return results;
-    }
-
-    private GeocodeResult resolveOfflineGeocodeResult(String query) {
-        String normalized = query == null ? "" : query.trim().toLowerCase();
-        for (Map.Entry<String, GeocodeResult> entry : OFFLINE_LOCATIONS.entrySet()) {
-            String key = entry.getKey();
-            if (normalized.isBlank() || key.contains(normalized) || normalized.contains(key)) {
-                return entry.getValue();
-            }
-        }
-        return new GeocodeResult(12.9716, 77.5946, query == null || query.isBlank() ? "Current location" : query);
-    }
-
-    private double round(double value) {
-        return Math.round(value * 100.0) / 100.0;
-    }
-
-    private String buildWarning(String riskLevel) {
-        String normalized = riskLevel == null ? "" : riskLevel.trim();
-        if ("High Risk".equalsIgnoreCase(normalized)) {
-            return "This route has a higher estimated risk. Consider using a better-lit or more populated option when possible.";
-        }
-        if ("Medium Risk".equalsIgnoreCase(normalized)) {
-            return "This route has a moderate estimate. Continue with caution and consider alternatives.";
-        }
-        return "This route looks comparatively safer based on the available model inputs.";
-    }
-
-    private record GeocodeResult(double lat, double lon, String displayName) {
+    private record Scored(RouteCandidate candidate, Analysis analysis, List<ZoneHit> zones) {
     }
 }

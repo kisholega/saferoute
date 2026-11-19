@@ -1,61 +1,28 @@
 package com.saferoute.ai.dto;
 
+import jakarta.validation.constraints.Email;
 import jakarta.validation.constraints.NotBlank;
-import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
 
-public class EmergencyContactRequest {
+/** Body for creating or updating an emergency contact. The owner is always the signed-in user. */
+public record EmergencyContactRequest(
+        @NotBlank(message = "Name is required.")
+        @Size(min = 2, max = 80, message = "Name must be 2 to 80 characters.")
+        String name,
 
-    @NotNull(message = "User id is required")
-    private Long userId;
+        @NotBlank(message = "Phone number is required.")
+        @Size(max = 25, message = "Phone number is too long.")
+        String phone,
 
-    @NotBlank(message = "Contact name is required")
-    private String name;
+        /** Optional: alerts are also emailed here when email sending is configured. */
+        @Email(message = "Enter a valid email address.")
+        @Size(max = 120, message = "Email is too long.")
+        String email,
 
-    @NotBlank(message = "Phone is required")
-    private String phone;
+        @NotBlank(message = "Relationship is required.")
+        @Size(max = 40, message = "Relationship must be at most 40 characters.")
+        String relation,
 
-    @NotBlank(message = "Relation is required")
-    private String relation;
-
-    private Boolean isPrimary = false;
-
-    public Long getUserId() {
-        return userId;
-    }
-
-    public void setUserId(Long userId) {
-        this.userId = userId;
-    }
-
-    public String getName() {
-        return name;
-    }
-
-    public void setName(String name) {
-        this.name = name;
-    }
-
-    public String getPhone() {
-        return phone;
-    }
-
-    public void setPhone(String phone) {
-        this.phone = phone;
-    }
-
-    public String getRelation() {
-        return relation;
-    }
-
-    public void setRelation(String relation) {
-        this.relation = relation;
-    }
-
-    public Boolean getIsPrimary() {
-        return isPrimary;
-    }
-
-    public void setIsPrimary(Boolean isPrimary) {
-        this.isPrimary = isPrimary;
-    }
+        /** true makes this the primary contact. false/null leaves the current primary unchanged. */
+        Boolean isPrimary) {
 }

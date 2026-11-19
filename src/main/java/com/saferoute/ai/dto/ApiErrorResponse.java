@@ -1,21 +1,16 @@
 package com.saferoute.ai.dto;
 
-import java.time.LocalDateTime;
+import java.time.Instant;
+import java.util.Map;
 
-public class ApiErrorResponse {
-    private final String message;
-    private final LocalDateTime timestamp;
+/** Every API error has this shape, so the frontend can always read {@code message}. */
+public record ApiErrorResponse(String message, Map<String, String> fieldErrors, Instant timestamp) {
 
-    public ApiErrorResponse(String message) {
-        this.message = message;
-        this.timestamp = LocalDateTime.now();
+    public static ApiErrorResponse of(String message) {
+        return new ApiErrorResponse(message, Map.of(), Instant.now());
     }
 
-    public String getMessage() {
-        return message;
-    }
-
-    public LocalDateTime getTimestamp() {
-        return timestamp;
+    public static ApiErrorResponse of(String message, Map<String, String> fieldErrors) {
+        return new ApiErrorResponse(message, fieldErrors, Instant.now());
     }
 }

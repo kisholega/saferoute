@@ -12,7 +12,7 @@
 
     <groupId>com.saferoute</groupId>
     <artifactId>saferoute-ai</artifactId>
-    <version>0.0.1-SNAPSHOT</version>
+    <version>1.0.0</version>
     <name>SafeRoute AI</name>
     <description>AI-based safety-aware route recommendation system</description>
 
@@ -34,6 +34,15 @@
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-mail</artifactId>
+        </dependency>
+        <!-- BCrypt password hashing only (no Spring Security filter chain) -->
+        <dependency>
+            <groupId>org.springframework.security</groupId>
+            <artifactId>spring-security-crypto</artifactId>
         </dependency>
         <dependency>
             <groupId>com.mysql</groupId>
